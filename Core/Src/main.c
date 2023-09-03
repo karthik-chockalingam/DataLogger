@@ -24,13 +24,13 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
 #include "string.h"
-#include "fatfs_sd.h"
 #include "lwip/opt.h"
 #include "lwip/api.h"
 #include "lwip/sys.h"
-
+#include "tcpserverTask.h"
+#include "configTask.h"
+#include "loggerTask.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -45,12 +45,6 @@
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-#define BIT_0	(1 << 0)
-#define BIT_1	(1 << 1)
-#define BIT_2	(1 << 2)
-#define BIT_3	(1 << 3)
-#define BIT_4	(1 << 4)
-#define BIT_5	(1 << 5)
 
 /* USER CODE END PM */
 
@@ -62,8 +56,8 @@ TIM_HandleTypeDef htim1;
 osThreadId defaultTaskHandle;
 
 /* USER CODE BEGIN PV */
-static struct netconn *conn, *newconn;
-static struct netbuf *buf;
+
+struct netconn *client_conn;
 
 typedef struct
 {
@@ -73,24 +67,11 @@ typedef struct
 	uint8_t setOperation;
 }logConfig;
 
-char user_config[4];
-
 TaskHandle_t configTaskHandle;
 TaskHandle_t loggerTaskHandle;
 
 QueueHandle_t configQueueHandle = NULL;
 EventGroupHandle_t eventhandleLog;
-
-char logMessage[100];
-
-volatile RTC_DateTypeDef currDate;
-volatile RTC_TimeTypeDef currTime;
-
-FATFS fs;
-FIL fil;
-FILINFO filinfo;
-FRESULT fresult;
-UINT readcount, writecount;
 
 /* USER CODE END PV */
 
@@ -104,11 +85,6 @@ static void MX_SPI1_Init(void);
 void StartDefaultTask(void const * argument);
 
 /* USER CODE BEGIN PFP */
-void tcpserver_init (void);
-static void tcpTask(void *arg);
-
-static void configTask(void *arg);
-static void loggerTask(void *arg);
 
 /* USER CODE END PFP */
 
@@ -185,7 +161,6 @@ int main(void)
   defaultTaskHandle = osThreadCreate(osThread(defaultTask), NULL);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
   BaseType_t status;
   status = xTaskCreate(configTask, "config-Task", 512, NULL, osPriorityNormal, &configTaskHandle);
   configASSERT(status == pdPASS);
@@ -553,292 +528,6 @@ static void MX_GPIO_Init(void)
 
 /* USER CODE BEGIN 4 */
 
-/**** Send RESPONSE every time the client sends some data ******/
-
-static void tcpTask(void *arg)
-{
-	err_t err, accept_err, recv_error;
-	logConfig clientConfig;
-	/* Create a new connection identifier. */
-	conn = netconn_new(NETCONN_TCP);
-	printf("Entering into tcpTask...\n");
-
-	if (conn!=NULL)
-	{
-		/* Bind connection to the port number 10022. */
-		err = netconn_bind(conn, IP_ADDR_ANY, 10022);
-
-		if (err == ERR_OK)
-		{
-			/* Tell connection to go into listening mode. */
-			netconn_listen(conn);
-
-			while (1)
-			{
-				/* Grab new connection. */
-				accept_err = netconn_accept(conn, &newconn);
-
-				/* Process the new connection. */
-				if (accept_err == ERR_OK)
-				{
-
-					/* receive the data from the client */
-					while (netconn_recv(newconn, &buf) == ERR_OK)
-					{
-						memset (user_config, '\0', 4);  // clear the buffer
-						strncpy (user_config, buf->p->payload, 4);   // get the message from the client
-
-						clientConfig.setAnalog = (uint8_t)user_config[0];
-						clientConfig.setDigital = (uint8_t)user_config[1];
-						clientConfig.setSamplerate = (uint8_t)user_config[2];
-						clientConfig.setOperation = (uint8_t)user_config[3];
-
-						BaseType_t status;
-						status = xQueueSend(configQueueHandle, (void*) &clientConfig, 0);
-						if(status == pdPASS)
-						{
-							printf("Queuing config ...\n");
-						}
-						else
-						{
-							printf("Queuing config error...\n");
-						}
-						//netconn_write(newconn, smsg, len, NETCONN_COPY);
-
-						netbuf_delete(buf);
-					}
-
-					/* Close connection and discard connection identifier. */
-					netconn_close(newconn);
-					netconn_delete(newconn);
-				}
-			}
-		}
-		else
-		{
-			netconn_delete(conn);
-		}
-	}
-}
-
-
-void tcpserver_init(void)
-{
-  sys_thread_new("tcp-task", tcpTask, NULL, 1024, osPriorityNormal);
-}
-
-
-static void configTask(void *arg)
-{
-	logConfig userConfig;
-	EventBits_t logEvents = 0x0000;
-	EventBits_t statusEvents = 0x0000;
-
-	while(1)
-	{
-		memset(&userConfig, '\0', sizeof(logConfig));
-		if(xQueueReceive(configQueueHandle, &(userConfig), portMAX_DELAY) == pdPASS)
-		{
-			printf("Dequeuing config message -- config task ..\n");
-			printf("Analog - %d\n", userConfig.setAnalog);
-			printf("Digital -%d\n", userConfig.setDigital);
-			printf("Sample Rate - %d\n", userConfig.setSamplerate);
-			printf("Operation - %d\n", userConfig.setOperation);
-
-			logEvents = 0x0000;
-
-			// Set bit 0 - Start logging
-			if(userConfig.setOperation == 2)
-			{
-				logEvents |= BIT_0;
-				// set bit 1 - log Analog
-				if(userConfig.setAnalog == 2)
-				{
-
-					logEvents |= BIT_1;
-				}
-
-				// set bit 2 - log Digital
-				if(userConfig.setDigital == 2)
-				{
-					logEvents |= BIT_2;
-				}
-
-				// set bit 3 & 4 - log samplerate; 01 - 1samples/sec, 10 - 5samples/sec, 11 - 10samples/sec
-				if(userConfig.setSamplerate == 1)
-				{
-					logEvents |= BIT_3;
-				}
-				else if(userConfig.setSamplerate == 2)
-				{
-					logEvents |= BIT_4;
-				}
-				else if(userConfig.setSamplerate == 3)
-				{
-					logEvents |= (BIT_3 | BIT_4);
-				}
-			}
-			// Set bit 5 - Stop logging
-			else if(userConfig.setOperation == 1)
-			{
-				logEvents |= BIT_5;
-			}
-
-			printf("logEvents is %x\n", logEvents);
-			statusEvents = xEventGroupSetBits(eventhandleLog, logEvents);
-			printf("statusEvents is %x\n", statusEvents);
-		}
-	}
-}
-
-static void loggerTask(void *arg)
-{
-	TickType_t lastwakeTime;
-
-	uint32_t adcValue;
-	uint32_t analogValue=0;
-	uint8_t gpioValue=0;
-	TickType_t tickdelayms = 0;
-	TickType_t tickdelay = 0;
-
-	EventBits_t eventLog;
-	EventBits_t reteventLog;
-
-	char filename[20];
-
-	const EventBits_t bitMask = (BIT_0 | BIT_5);
-
-	int len = 0;
-	HAL_StatusTypeDef status;
-
-	while(1)
-	{
-		printf("logger Task ...\n");
-		eventLog = xEventGroupWaitBits(eventhandleLog, bitMask, pdFALSE, pdFALSE, portMAX_DELAY);
-
-		if((eventLog & (BIT_0 | BIT_5)) == BIT_0)
-		{
-			if((eventLog & (BIT_3 | BIT_4)) == BIT_3)
-			{
-				tickdelayms = 1000;
-			}
-			else if ((eventLog & (BIT_3 | BIT_4)) == BIT_4)
-			{
-				tickdelayms = 200;
-			}
-			else if ((eventLog & (BIT_3 | BIT_4)) == (BIT_3 | BIT_4))
-			{
-				tickdelayms = 100;
-			}
-
-			// File System Mount
-			fresult = f_mount(&fs, "/", 1);
-			if(fresult != FR_OK)
-			{
-				printf("SD Card mount Error...\n");
-			}
-			else
-			{
-				printf("SD card mounted...\n");
-			}
-
-			status = HAL_RTC_GetTime(&hrtc, &currTime, RTC_FORMAT_BIN);
-			if(status != HAL_OK)
-			{
-				printf("Get Time Error...\n");
-			}
-
-			//Call HAL_RTC_GetDate after HAL_RTC_GetTime
-			status = HAL_RTC_GetDate(&hrtc, &currDate, RTC_FORMAT_BIN);
-			if(status != HAL_OK)
-			{
-				printf("Get Date Error...\n");
-			}
-
-			len = sprintf((char*)filename, "%02d-%02d_%02d-%02d-%02d.txt", currDate.Date, currDate.Month, currTime.Hours, currTime.Minutes, currTime.Seconds);
-			printf("File name is %s\n", filename);
-			fresult = f_open(&fil, filename, FA_OPEN_ALWAYS | FA_READ | FA_WRITE);
-			if(fresult != FR_OK)
-			{
-				printf("File creation failed...\n");
-			}
-			else
-			{
-				printf("File created successfully...\n");
-			}
-		}
-
-		while((eventLog & (BIT_0 | BIT_5)) == BIT_0)
-		{
-			lastwakeTime = xTaskGetTickCount();
-
-			status = HAL_RTC_GetTime(&hrtc, &currTime, RTC_FORMAT_BIN);
-			if(status != HAL_OK)
-			{
-				printf("Get Time Error...\n");
-			}
-
-			//Call HAL_RTC_GetDate after HAL_RTC_GetTime
-			status = HAL_RTC_GetDate(&hrtc, &currDate, RTC_FORMAT_BIN);
-			if(status != HAL_OK)
-			{
-				printf("Get Date Error...\n");
-			}
-
-			len = sprintf((char*)logMessage, "%02d-%02d-%04d    %02d:%02d:%02d    ", currDate.Date, currDate.Month, 2000+currDate.Year,
-																								currTime.Hours, currTime.Minutes, currTime.Seconds);
-
-			if((eventLog & BIT_1) == BIT_1)
-			{
-				HAL_ADC_Start(&hadc1);
-				HAL_ADC_PollForConversion(&hadc1, 10);
-				adcValue = HAL_ADC_GetValue(&hadc1);
-				analogValue = (adcValue * 3300) / 4095;
-				HAL_ADC_Stop(&hadc1);
-
-				len = sprintf((char*)logMessage+strlen(logMessage), "Analog-%d    ", analogValue);
-			}
-
-			if((eventLog & BIT_2) == BIT_2)
-			{
-				gpioValue = HAL_GPIO_ReadPin(GPIOG, GPIO_PIN_1);
-				len = sprintf((char*)logMessage+strlen(logMessage), "Digital-%d", gpioValue);
-			}
-
-			len = sprintf((char*)logMessage+strlen(logMessage), "\n");
-			netconn_write(newconn, logMessage, strlen(logMessage), NETCONN_COPY);
-			fresult = f_write(&fil, logMessage, strlen(logMessage), &writecount);
-			printf("The write count and strlen of log message is %d and %d", writecount, strlen(logMessage));
-			printf("%s\n", logMessage);
-			memset (logMessage, '\0', 100);
-
-			tickdelay = pdMS_TO_TICKS(tickdelayms);
-			vTaskDelayUntil(&lastwakeTime, tickdelay);
-
-			eventLog = xEventGroupWaitBits(eventhandleLog, bitMask, pdFALSE, pdFALSE, portMAX_DELAY);
-			if ((eventLog & (BIT_0 | BIT_5)) == (BIT_0 | BIT_5))
-			{
-				f_close(&fil);
-				fresult = f_mount(NULL, "/", 1);
-				if(fresult == FR_OK)
-				{
-					printf("SD card unmounted successfully...\n");
-				}
-				break;
-			}
-		}
-
-		printf("The event log after exiting while is %x\n", eventLog);
-
-		reteventLog = xEventGroupClearBits(eventhandleLog, 0xFF);
-		eventLog = xEventGroupGetBits(eventhandleLog);
-		printf("The event log after clearing is %x\n", eventLog);
-		if (eventLog == 0x00)
-		{
-			printf(" All event bits are cleared..\n");
-		}
-	}
-}
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -857,8 +546,8 @@ void StartDefaultTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-	printf("Default Task..\n");
-    osDelay(60000);
+		printf("Default Task..\n");
+	    osDelay(60000);
   }
   /* USER CODE END 5 */
 }
